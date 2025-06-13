@@ -6,8 +6,8 @@ import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath
 
-from models.ss2d import SS2D, SS2DGlobal
-from VMamba.vmamba import VSSM, Mlp, LayerNorm
+from models.ss2d import SS2DGlobal
+from VMamba.vmamba import VSSM, SS2D, Mlp, LayerNorm, VSSBlock
 
 
 # ------------------------
@@ -182,6 +182,7 @@ class HSVSSBlock(nn.Module):
         return x
 
     def forward(self, input: torch.Tensor):
+        print(input.shape)
         if self.use_checkpoint:
             return checkpoint.checkpoint(self._forward, input)
         else:
@@ -219,7 +220,8 @@ class HSVSSM(VSSM):
         depth = len(drop_path)
         blocks = []
         for i, d in enumerate(range(depth)):
-            blocks.append(HSVSSBlock(
+            block = VSSBlock if i == depth - 1 else HSVSSBlock
+            blocks.append(block(
                 hidden_dim=dim,
                 drop_path=drop_path[d],
                 norm_layer=norm_layer,

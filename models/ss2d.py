@@ -1,20 +1,68 @@
+from functools import partial
+
 import torch
 import torch.nn as nn
-from VMamba.vmamba import SS2D, SS2Dv2, selective_scan_fn
+import math
+from VMamba.vmamba import SS2Dv2, Linear, mamba_init, selective_scan_fn
 # from VMamba.vmamba import cross_scan_fn, cross_merge_fn
 from models.scan import cross_scan_fn, cross_merge_fn
+
 
 # support: v01-v05; v051d,v052d,v052dc;
 # postfix: _onsigmoid,_onsoftmax,_ondwconv3,_onnone;_nozact,_noz;_oact;_no32;
 # history support: v2,v3;v31d,v32d,v32dc;
 class SS2Dv2Global(SS2Dv2):
+    def __initv2global__(
+            self,
+            dt_min=0.001,
+            dt_max=0.1,
+            dt_init="random",
+            dt_scale=1.0,
+            dt_init_floor=1e-4,
+            initialize="v0",
+            **kwargs,
+    ):
+        self.__initv2__(
+            dt_min=dt_min,
+            dt_max=dt_max,
+            dt_init=dt_init,
+            dt_scale=dt_scale,
+            dt_init_floor=dt_init_floor,
+            initialize=initialize,
+            **kwargs
+        )
+
+        self.k_group = 1
+        self.x_proj = Linear(self.d_inner, self.k_group * (self.dt_rank + self.d_state * 2), groups=self.k_group, bias=False, channel_first=True)
+        self.dt_projs = Linear(self.dt_rank, self.k_group * self.d_inner, groups=self.k_group, bias=False, channel_first=True)
+
+        if initialize in ["v0"]:
+            self.A_logs, self.Ds, self.dt_projs_weight, self.dt_projs_bias = mamba_init.init_dt_A_D(
+                self.d_state, self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor, k_group=self.k_group,
+            )
+        elif initialize in ["v1"]:
+            # simple init dt_projs, A_logs, Ds
+            self.Ds = nn.Parameter(torch.ones((self.k_group * self.d_inner)))
+            self.A_logs = nn.Parameter(torch.randn((self.k_group * self.d_inner, self.d_state)))  # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
+            self.dt_projs_weight = nn.Parameter(0.1 * torch.randn((self.k_group, self.d_inner, self.dt_rank)))  # 0.1 is added in 0430
+            self.dt_projs_bias = nn.Parameter(0.1 * torch.randn((self.k_group, self.d_inner)))  # 0.1 is added in 0430
+        elif initialize in ["v2"]:
+            # simple init dt_projs, A_logs, Ds
+            self.Ds = nn.Parameter(torch.ones((self.k_group * self.d_inner)))
+            self.A_logs = nn.Parameter(torch.zeros((self.k_group * self.d_inner, self.d_state)))  # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
+            self.dt_projs_weight = nn.Parameter(0.1 * torch.rand((self.k_group, self.d_inner, self.dt_rank)))
+            self.dt_projs_bias = nn.Parameter(0.1 * torch.rand((self.k_group, self.d_inner)))
+        self.dt_projs.weight.data = self.dt_projs_weight.data.view(self.dt_projs.weight.shape)
+        del self.dt_projs_weight
+
     def forward_corev2(
             self,
             x: torch.Tensor = None,
             force_fp32=False,  # True: input fp32
             ssoflex=True,  # True: input 16 or 32 output 32 False: output dtype as input
             selective_scan_backend=None,
-            scan_mode="cross2d",
+            scan_mode=4,
+            window_size=7,
             scan_force_torch=False,
             **kwargs,
     ):
@@ -32,11 +80,9 @@ class SS2Dv2Global(SS2Dv2):
         L = H * W
 
         def selective_scan(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=True):
-            return selective_scan_fn(u, delta, A, B, C, D, delta_bias, delta_softplus, ssoflex,
-                                     backend=selective_scan_backend)
+            return selective_scan_fn(u, delta, A, B, C, D, delta_bias, delta_softplus, ssoflex, backend=selective_scan_backend)
 
-        xs = cross_scan_fn(x, in_channel_first=True, out_channel_first=True, scans=_scan_mode,
-                           force_torch=scan_force_torch)
+        xs = cross_scan_fn(x, in_channel_first=True, out_channel_first=True, scans=_scan_mode, force_torch=scan_force_torch, window_size=window_size, base_B=B)
         x_dbl = self.x_proj(xs.view(B, -1, L))
         dts, Bs, Cs = torch.split(x_dbl.view(B, K, -1, L), [R, N, N], dim=2)
         dts = dts.contiguous().view(B, -1, L)
@@ -53,12 +99,8 @@ class SS2Dv2Global(SS2Dv2):
         if force_fp32:
             xs, dts, Bs, Cs = to_fp32(xs, dts, Bs, Cs)
 
-        ys: torch.Tensor = selective_scan(
-            xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus
-        ).view(B, K, -1, H, W)
-
-        y: torch.Tensor = cross_merge_fn(ys, in_channel_first=True, out_channel_first=True, scans=_scan_mode,
-                                         force_torch=scan_force_torch)
+        ys: torch.Tensor = selective_scan(xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus).view(B, K, -1, H, W)
+        y: torch.Tensor = cross_merge_fn(ys, in_channel_first=True, out_channel_first=True, scans=_scan_mode, force_torch=scan_force_torch)
 
         if getattr(self, "__DEBUG__", False):
             setattr(self, "__data__", dict(
@@ -71,26 +113,7 @@ class SS2Dv2Global(SS2Dv2):
         if not channel_first:
             y = y.permute(0, 2, 3, 1).contiguous()
         y = self.out_norm(y)
-
         return y.to(x.dtype)
-
-    def forwardv2(self, x: torch.Tensor, **kwargs):
-        x = self.in_proj(x)
-        if not self.disable_z:
-            x, z = x.chunk(2, dim=(1 if self.channel_first else -1))  # (b, h, w, d)
-            if not self.disable_z_act:
-                z = self.act(z)
-        if not self.channel_first:
-            x = x.permute(0, 3, 1, 2).contiguous()
-        if self.with_dconv:
-            x = self.conv2d(x)  # (b, d, h, w)
-        x = self.act(x)
-        y = self.forward_core(x)
-        y = self.out_act(y)
-        if not self.disable_z:
-            y = y * z
-        out = self.dropout(self.out_proj(y))
-        return out
 
 
 class SS2DGlobal(nn.Module, SS2Dv2Global):
@@ -130,12 +153,9 @@ class SS2DGlobal(nn.Module, SS2Dv2Global):
         )
         if forward_type in ["v0", "v0seq"]:
             raise NotImplementedError
-            # self.__initv0__(seq=("seq" in forward_type), **kwargs)
         elif forward_type.startswith("xv"):
             raise NotImplementedError
-            # self.__initxv__(**kwargs)
         elif forward_type.startswith("m"):
-            # self.__initm0__(**kwargs)
             raise NotImplementedError
         else:
-            self.__initv2__(**kwargs)
+            self.__initv2global__(**kwargs)

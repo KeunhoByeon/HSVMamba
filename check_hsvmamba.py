@@ -28,8 +28,8 @@ def test_hsvss_block():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total Parameters: {total_params:,}")
     print(f"Trainable Parameters: {trainable_params:,}")
-    exit(0)
-    B, C, H, W = 4, 3, 224, 224
+
+    B, C, H, W = 5, 3, 224, 224
     x = torch.randn(B, C, H, W, requires_grad=True)
     y = torch.randint(0, 999, (B,))
 
