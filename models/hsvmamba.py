@@ -182,7 +182,6 @@ class HSVSSBlock(nn.Module):
         return x
 
     def forward(self, input: torch.Tensor):
-        print(input.shape)
         if self.use_checkpoint:
             return checkpoint.checkpoint(self._forward, input)
         else:

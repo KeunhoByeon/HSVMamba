@@ -269,7 +269,7 @@ class CrossScanF(torch.autograd.Function):
             raise NotImplementedError
 
         ys = ys.view(B, -1, C, H, W) if out_channel_first else ys.view(B, H, W, -1, C)
-        y = cross_merge_fwd(ys, in_channel_first, out_channel_first, scans, window_size)
+        y = cross_merge_fwd(ys, in_channel_first, out_channel_first, scans)
         y = y.view(B, -1, H, W) if in_channel_first else y.view(B, H, W, -1)
 
         return y, None, None, None, None
